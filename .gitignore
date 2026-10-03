@@ -1,0 +1,12 @@
+/kotori
+/dist/
+*.parts/
+*.part
+*.download
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.vtt
+.DS_Store
