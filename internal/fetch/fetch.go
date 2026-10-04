@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -75,15 +76,28 @@ func (c *Client) Get(ctx context.Context, rawURL string, headers map[string]stri
 		return nil, fmt.Errorf("GET %s: %w", rawURL, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		retryAfter, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
 		return nil, &StatusError{
 			URL:        rawURL,
 			Code:       resp.StatusCode,
 			Status:     resp.Status,
-			RetryAfter: time.Duration(retryAfter) * time.Second,
+			RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		}
 	}
 	return &Response{Body: body, URL: resp.Request.URL}, nil
+}
+
+// retryAfter reads a Retry-After header, which is either a number of seconds
+// or a date. It returns zero when the header is missing, unreadable or
+// already past.
+func retryAfter(header string, now time.Time) time.Duration {
+	header = strings.TrimSpace(header)
+	if seconds, err := strconv.Atoi(header); err == nil {
+		return max(time.Duration(seconds)*time.Second, 0)
+	}
+	if at, err := http.ParseTime(header); err == nil {
+		return max(at.Sub(now), 0)
+	}
+	return 0
 }
 
 // GetJSON fetches rawURL and decodes the body into v.

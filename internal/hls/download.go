@@ -10,19 +10,38 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/brysonreece/kotori/internal/aescbc"
 	"github.com/brysonreece/kotori/internal/fetch"
+	"github.com/brysonreece/kotori/internal/throttle"
 )
 
-const segmentAttempts = 8
+// segmentAttempts is how many times a segment is tried before a failure
+// other than rate limiting is final. Rate limiting is waited out instead,
+// up to maxRefusals times.
+const (
+	segmentAttempts = 4
+	maxRefusals     = 30
+)
 
 // retryBackoff is the base delay between attempts at a failed segment.
 var retryBackoff = 500 * time.Millisecond
 
-// maxRateLimitPause caps how long one rate-limit response holds things up.
-const maxRateLimitPause = time.Minute
+// maxBackoff caps the pause used when a rate-limit response does not say how
+// long to wait.
+const maxBackoff = time.Minute
+
+// rateLimitPause is how long to hold off after a 429. The server's
+// Retry-After is taken at its word; without one, the pause doubles with each
+// attempt at the segment.
+func rateLimitPause(retryAfter time.Duration, attempt int) time.Duration {
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	return min(retryBackoff<<attempt, maxBackoff)
+}
 
 // Downloader fetches every segment of a stream and joins them into one file.
 type Downloader struct {
@@ -34,41 +53,35 @@ type Downloader struct {
 	Concurrency int
 	// Progress, when set, is called after each finished segment.
 	Progress func(Progress)
-	// Logf, when set, receives notices such as rate-limit pauses.
-	Logf func(format string, args ...any)
+	// Limiter paces requests per host. Downloads that run at the same time
+	// should share one, so that they share each host's allowance. If nil,
+	// the download gets one of its own.
+	Limiter *throttle.Limiter
 
-	gate gate
+	// zone is the host the segments are limited under, once it is known.
+	zone atomic.Value
 }
 
-// gate lets one worker's rate-limit response pause every worker, so the
-// others do not keep hitting a server that has asked for a break.
-type gate struct {
-	mu    sync.Mutex
-	until time.Time
-}
-
-func (g *gate) pause(d time.Duration) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if until := time.Now().Add(d); until.After(g.until) {
-		g.until = until
+// Paused reports how much longer the download is held up by its host's rate
+// limit, or zero if it is not. It is safe to call while Download runs. The
+// hold may have been caused by another download sharing the host.
+func (d *Downloader) Paused() time.Duration {
+	zone, _ := d.zone.Load().(string)
+	if zone == "" || d.Limiter == nil {
+		return 0
 	}
+	return d.Limiter.Blocked(zone)
 }
 
-func (g *gate) wait(ctx context.Context) error {
-	for {
-		g.mu.Lock()
-		remaining := time.Until(g.until)
-		g.mu.Unlock()
-		if remaining <= 0 {
-			return ctx.Err()
-		}
-		select {
-		case <-time.After(remaining):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+// Pace reports the rate the download's host is being held to, in segments
+// per second, or zero if it is not being paced. Downloads that share the
+// host share that rate.
+func (d *Downloader) Pace() float64 {
+	zone, _ := d.zone.Load().(string)
+	if zone == "" || d.Limiter == nil {
+		return 0
 	}
+	return d.Limiter.Rate(zone)
 }
 
 // Progress reports how far a download has got.
@@ -90,6 +103,9 @@ type Result struct {
 // Finished segments are kept in dest+".parts" until the file is assembled, so
 // an interrupted download resumes where it stopped.
 func (d *Downloader) Download(ctx context.Context, manifestURL, dest string) (*Result, error) {
+	if d.Limiter == nil {
+		d.Limiter = throttle.New()
+	}
 	media, height, err := d.mediaPlaylist(ctx, manifestURL)
 	if err != nil {
 		return nil, err
@@ -98,6 +114,7 @@ func (d *Downloader) Download(ctx context.Context, manifestURL, dest string) (*R
 	if len(segments) == 0 {
 		return nil, errors.New("hls: playlist has no downloadable segments")
 	}
+	d.zone.Store(throttle.Zone(segments[0].URI))
 	keys, err := d.fetchKeys(ctx, segments)
 	if err != nil {
 		return nil, err
@@ -240,36 +257,41 @@ func (d *Downloader) segment(ctx context.Context, seg Segment, keys map[string][
 		return info.Size(), nil
 	}
 
+	host := throttle.Zone(seg.URI)
 	var data []byte
 	var err error
-	for attempt := 1; ; attempt++ {
-		if err := d.gate.wait(ctx); err != nil {
+	for attempt, refusals := 1, 0; ; {
+		if err := d.Limiter.Wait(ctx, host); err != nil {
 			return 0, err
 		}
 		var resp *fetch.Response
 		resp, err = d.Client.Get(ctx, seg.URI, d.Headers)
 		if err == nil {
+			d.Limiter.Allowed(host)
 			data = resp.Body
 			break
 		}
-		if attempt == segmentAttempts || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return 0, err
 		}
 		var status *fetch.StatusError
 		if errors.As(err, &status) && status.Code == http.StatusTooManyRequests {
-			// Honor Retry-After, otherwise back off exponentially.
-			pause := min(max(status.RetryAfter, retryBackoff<<attempt), maxRateLimitPause)
-			d.gate.pause(pause)
-			if d.Logf != nil {
-				d.Logf("rate limited, pausing for %s", pause.Round(time.Millisecond))
+			// Being told to slow down is not a failure of this segment.
+			if refusals++; refusals > maxRefusals {
+				return 0, err
 			}
+			d.Limiter.Refused(host, rateLimitPause(status.RetryAfter, refusals), status.RetryAfter)
 			continue
+		}
+		if attempt == segmentAttempts {
+			return 0, err
 		}
 		select {
 		case <-time.After(time.Duration(attempt) * retryBackoff):
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
+		attempt++
 	}
 
 	data = stripPNG(data)

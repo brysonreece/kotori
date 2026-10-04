@@ -25,6 +25,30 @@ func fakeSite(t *testing.T) *httptest.Server {
 		fmt.Fprintf(w, `<html><h1 class="title d-title"> My Show </h1>
 			<script>fetch("%s/anime/getinfo/42")</script></html>`, server.URL)
 	})
+	mux.HandleFunc("/filter", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("keyword") != "my show" {
+			fmt.Fprint(w, `<html><div id="list-items"></div></html>`)
+			return
+		}
+		fmt.Fprintf(w, `<html>
+			<aside><div class="item"><a class="name" href="/watch/sidebar-show/ep-1">Sidebar</a></div></aside>
+			<div id="list-items">
+				<div class="item"><div class="inner">
+					<div class="ani poster"><a href="%[1]s/watch/my-show-abc12/ep-1"><div class="meta"><div class="inner">
+						<div class="left"><span class="ep-status sub"><span> 24</span></span><span class="ep-status dub"><span> 12</span></span></div>
+						<div class="right">TV</div>
+					</div></div></a></div>
+					<div class="info"><a class="name d-title" href="%[1]s/watch/my-show-abc12/ep-1"> My Show </a></div>
+				</div></div>
+				<div class="item"><div class="inner">
+					<div class="ani poster"><a href="/watch/my-show-the-movie-zz9/ep-1"><div class="meta"><div class="inner">
+						<div class="left"><span class="ep-status sub"><span> 1</span></span></div>
+						<div class="right">Movie</div>
+					</div></div></a></div>
+					<div class="info"><a class="name d-title" href="/watch/my-show-the-movie-zz9/ep-1">My Show: The Movie</a></div>
+				</div></div>
+			</div></html>`, server.URL)
+	})
 	mux.HandleFunc("/ajax/episode/list/42", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"result": `<ul>
 			<li data-html="true" title="Pilot"><a data-ids="ids-1" data-mal="7" data-timestamp="99"></a></li>
@@ -73,7 +97,7 @@ func fakeSite(t *testing.T) *httptest.Server {
 func TestLoadServersAndResolve(t *testing.T) {
 	server := fakeSite(t)
 	ctx := context.Background()
-	site := New(fetch.New())
+	site := New(fetch.New(), server.URL)
 
 	series, err := site.Load(ctx, server.URL+"/watch/my-show/ep-1")
 	if err != nil {
@@ -121,7 +145,29 @@ func TestLoadRejectsOtherPages(t *testing.T) {
 		fmt.Fprint(w, "<html><h1>Home</h1></html>")
 	}))
 	defer server.Close()
-	if _, err := New(fetch.New()).Load(context.Background(), server.URL); err == nil {
+	if _, err := New(fetch.New(), server.URL).Load(context.Background(), server.URL); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestSearch(t *testing.T) {
+	server := fakeSite(t)
+	site := New(fetch.New(), server.URL+"/")
+
+	results, err := site.Search(context.Background(), "my show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Result{
+		{Title: "My Show", URL: server.URL + "/watch/my-show-abc12", Kind: "TV", Sub: 24, Dub: 12},
+		{Title: "My Show: The Movie", URL: server.URL + "/watch/my-show-the-movie-zz9", Kind: "Movie", Sub: 1},
+	}
+	if len(results) != 2 || results[0] != want[0] || results[1] != want[1] {
+		t.Fatalf("got %+v, want %+v", results, want)
+	}
+
+	none, err := site.Search(context.Background(), "nothing")
+	if err != nil || len(none) != 0 {
+		t.Errorf("got %+v, %v; want no results", none, err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -19,12 +20,26 @@ import (
 // Sources lists the server names the site is known to offer.
 var Sources = []string{"megaplay", "vidstream", "kiwi", "vidcloud", "vidplay", "hd"}
 
+// ErrNotSeries is returned by Load for a page that is not a series.
+var ErrNotSeries = errors.New("anikoto: that page is not a series; check the slug or URL")
+
 // Site is a session against one Anikoto domain.
 type Site struct {
 	http *fetch.Client
-	// origin is the scheme and host the series page was finally served from.
-	// The site moves between domains, so it is learned from the first request.
+	// origin is the scheme and host requests go to. The site moves between
+	// domains, so it is updated to wherever a series page was finally served
+	// from.
 	origin string
+}
+
+// Result is one entry of a search.
+type Result struct {
+	Title string
+	URL   string
+	// Kind is the site's label, such as "TV" or "Movie".
+	Kind string
+	// Sub and Dub count the episodes available with each audio type.
+	Sub, Dub int
 }
 
 // Series is a show and its episodes.
@@ -64,9 +79,50 @@ type Stream struct {
 	Tracks  []Track
 }
 
-// New returns a Site that makes its requests through c.
-func New(c *fetch.Client) *Site {
-	return &Site{http: c}
+// New returns a Site at origin, such as "https://anikototv.to", that makes
+// its requests through c.
+func New(c *fetch.Client, origin string) *Site {
+	return &Site{http: c, origin: strings.TrimRight(origin, "/")}
+}
+
+var episodeSuffix = regexp.MustCompile(`/ep-\d+/?$`)
+
+// Search returns the first page of series matching query. The site has no
+// relevance ranking, so results are ordered by popularity, which puts a main
+// series ahead of its specials and films.
+func (s *Site) Search(ctx context.Context, query string) ([]Result, error) {
+	params := url.Values{"keyword": {query}, "sort": {"most-viewed"}}
+	resp, err := s.http.Get(ctx, s.origin+"/filter?"+params.Encode(), s.headers(""))
+	if err != nil {
+		return nil, err
+	}
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(resp.Body))
+	if err != nil {
+		return nil, err
+	}
+	count := func(item *goquery.Selection, audio string) int {
+		n, _ := strconv.Atoi(strings.TrimSpace(item.Find(".ep-status." + audio).First().Text()))
+		return n
+	}
+	var results []Result
+	doc.Find("#list-items .item").Each(func(_ int, item *goquery.Selection) {
+		link := item.Find("a.name").First()
+		href, err := resp.URL.Parse(link.AttrOr("href", ""))
+		title := strings.TrimSpace(link.Text())
+		if err != nil || title == "" || !strings.Contains(href.Path, "/watch/") {
+			return
+		}
+		// Results link to the first episode; the series page is its parent.
+		href.Path = episodeSuffix.ReplaceAllString(href.Path, "")
+		results = append(results, Result{
+			Title: title,
+			URL:   href.String(),
+			Kind:  strings.TrimSpace(item.Find(".poster .meta .right").First().Text()),
+			Sub:   count(item, "sub"),
+			Dub:   count(item, "dub"),
+		})
+	})
+	return results, nil
 }
 
 func (s *Site) headers(referer string) map[string]string {
@@ -88,7 +144,7 @@ func (s *Site) Load(ctx context.Context, pageURL string) (*Series, error) {
 	idRe := regexp.MustCompile(regexp.QuoteMeta(s.origin) + `/anime/getinfo/(\d+)`)
 	id := idRe.FindSubmatch(resp.Body)
 	if id == nil {
-		return nil, errors.New("anikoto: that page is not a series; check the slug or URL")
+		return nil, ErrNotSeries
 	}
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(resp.Body))
 	if err != nil {

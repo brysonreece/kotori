@@ -6,17 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/pflag"
 
 	"github.com/brysonreece/kotori/internal/anikoto"
 	"github.com/brysonreece/kotori/internal/fetch"
 	"github.com/brysonreece/kotori/internal/ffmpeg"
-	"github.com/brysonreece/kotori/internal/hls"
+	"github.com/brysonreece/kotori/internal/throttle"
+	"github.com/brysonreece/kotori/internal/tui"
 )
 
 const version = "0.1.0"
@@ -24,27 +28,49 @@ const version = "0.1.0"
 var qualities = []int{2160, 1440, 1080, 720, 480, 360}
 
 type options struct {
-	url          string
-	quality      int
-	audio        string
-	format       string
-	sources      []string
-	episodes     string
-	last         bool
-	list         bool
-	path         string
-	subtitles    bool
-	subtitleLang string
-	concurrency  int
-	debug        bool
+	// url is the series page to load, or empty to search for one.
+	url string
+	// query is what to search for when there is no url, or when url turns
+	// out not to exist.
+	query string
+	// bareWord is set when the argument could be a slug or a search term.
+	bareWord bool
+	// origin is the site address, as scheme and host.
+	origin string
+	// given records which settings came from flags, so the wizard only asks
+	// for the rest.
+	given struct{ episodes, audio, quality, format, subtitles, path, naming bool }
+	// yes skips the settings questions and uses the defaults.
+	yes      bool
+	quality  int
+	audio    string
+	format   string
+	sources  []string
+	episodes string
+	last     bool
+	list     bool
+	path     string
+	// template is the file name pattern, relative to path.
+	template       string
+	subtitles      bool
+	subtitleLang   string
+	subtitleFormat string
+	concurrency    int
+	// jobs is how many episodes are downloaded at once.
+	jobs  int
+	debug bool
 }
 
 type app struct {
 	opts options
+	// interactive is set when a person is at the terminal to answer questions.
+	interactive bool
 	// ffmpeg is the path to the ffmpeg binary.
 	ffmpeg string
-	stdout io.Writer
-	stderr io.Writer
+	// limiter paces requests per CDN host across all episodes in flight.
+	limiter *throttle.Limiter
+	stdout  io.Writer
+	stderr  io.Writer
 }
 
 // Run executes the command and returns its exit code.
@@ -57,13 +83,33 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "kotori: %v\nTry 'kotori --help'.\n", err)
 		return 2
 	}
-	a := &app{opts: *opts, stdout: stdout, stderr: stderr}
-	if err := a.run(ctx); err != nil {
+	a := &app{opts: *opts, stdout: stdout, stderr: stderr, limiter: throttle.New(), interactive: isTerminal(os.Stdin) && isTerminal(stderr)}
+	switch err := a.run(ctx); {
+	case errors.Is(err, tui.ErrCancelled):
+		return 130
+	case err != nil:
 		fmt.Fprintf(stderr, "kotori: %v\n", err)
 		return 1
 	}
 	return 0
 }
+
+func isTerminal(v any) bool {
+	f, ok := v.(*os.File)
+	return ok && isatty.IsTerminal(f.Fd())
+}
+
+const usage = `Download anime from Anikoto.
+
+Usage:
+  kotori [flags] [series or search terms]
+
+With no arguments, kotori asks what to search for, then for anything not
+given as a flag. The argument can be a series slug such as dragon-ball-gxrfm,
+the URL of any of its pages, or words to search for.
+
+Flags:
+`
 
 var errVersion = errors.New("version requested")
 
@@ -86,25 +132,26 @@ func parseFlags(args []string, stdout io.Writer) (*options, error) {
 	fs.BoolVar(&opts.last, "last", false, "download only the latest episode")
 	fs.BoolVar(&opts.list, "list", false, "list episodes and exit")
 	fs.StringVarP(&opts.path, "path", "p", ".", "directory to save into")
+	fs.StringVarP(&opts.template, "output", "o", defaultTemplate, "file name pattern, without the extension; "+templateHint)
 	fs.StringVarP(&baseURL, "base-url", "b", "", "site address to use instead of the one in the URL (default "+defaultBaseURL+", or $"+baseURLEnv+")")
 	fs.BoolVar(&noSubtitles, "no-subtitles", false, "skip subtitle downloads")
+	fs.StringVar(&opts.subtitleFormat, "subtitle-format", "vtt", "subtitle format: "+strings.Join(ffmpeg.SubtitleFormats(), ", "))
 	fs.StringVarP(&opts.subtitleLang, "subtitle-lang", "l", "English", "subtitle language, matched against track labels")
-	fs.IntVarP(&opts.concurrency, "concurrency", "c", 8, "segments to download at once")
+	fs.IntVarP(&opts.jobs, "jobs", "j", 4, "episodes to download at once")
+	fs.IntVarP(&opts.concurrency, "concurrency", "c", 8, "segments to download at once, per episode")
+	fs.BoolVarP(&opts.yes, "yes", "y", false, "don't ask for settings; use the defaults for anything not given")
 	fs.BoolVar(&opts.debug, "debug", false, "print every request and skipped server")
 	fs.BoolVarP(&showVersion, "version", "v", false, "print the version and exit")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
-			fmt.Fprintf(stdout, "Download anime from Anikoto.\n\nUsage:\n  kotori [flags] <series>\n\nThe series is the slug from its address on the site, such as dragon-ball-gxrfm,\nor the full URL of any of its pages.\n\nFlags:\n%s", fs.FlagUsages())
+			fmt.Fprint(stdout, usage+fs.FlagUsages())
 		}
 		return nil, err
 	}
 	if showVersion {
 		fmt.Fprintln(stdout, "kotori", version)
 		return nil, errVersion
-	}
-	if fs.NArg() != 1 {
-		return nil, errors.New("expected exactly one series, such as dragon-ball-gxrfm")
 	}
 	// The flag wins over the environment, which wins over the built-in default.
 	explicitBase := true
@@ -114,8 +161,30 @@ func parseFlags(args []string, stdout io.Writer) (*options, error) {
 	if baseURL == "" {
 		baseURL, explicitBase = defaultBaseURL, false
 	}
-	var err error
-	if opts.url, err = watchURL(fs.Arg(0), baseURL, explicitBase); err != nil {
+	origin, err := parseBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	opts.origin = origin.Scheme + "://" + origin.Host
+
+	// One argument is a slug or URL. A single plain word might instead be a
+	// search term, which is found out when it is looked up. Several words
+	// are always a search.
+	opts.query = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if fs.NArg() == 1 && opts.query != "" && !strings.ContainsAny(opts.query, " \t") {
+		if opts.url, err = watchURL(opts.query, baseURL, explicitBase); err != nil {
+			return nil, err
+		}
+		opts.bareWord = !strings.Contains(opts.query, "/")
+	}
+	opts.given.episodes = fs.Changed("episodes") || opts.last
+	opts.given.audio = fs.Changed("audio")
+	opts.given.quality = fs.Changed("quality")
+	opts.given.format = fs.Changed("format")
+	opts.given.subtitles = fs.Changed("subtitle-format") || noSubtitles
+	opts.given.path = fs.Changed("path")
+	opts.given.naming = fs.Changed("output")
+	if err := validateTemplate(opts.template); err != nil {
 		return nil, err
 	}
 	opts.subtitles = !noSubtitles
@@ -127,6 +196,10 @@ func parseFlags(args []string, stdout io.Writer) (*options, error) {
 	}
 	if opts.audio != "sub" && opts.audio != "dub" {
 		return nil, fmt.Errorf("invalid audio type %q: use sub or dub", opts.audio)
+	}
+	opts.subtitleFormat = strings.TrimPrefix(strings.ToLower(opts.subtitleFormat), ".")
+	if !ffmpeg.SupportedSubtitle(opts.subtitleFormat) {
+		return nil, fmt.Errorf("invalid subtitle format %q: choose from %s", opts.subtitleFormat, strings.Join(ffmpeg.SubtitleFormats(), ", "))
 	}
 	if !ffmpeg.Supported(opts.format) {
 		return nil, fmt.Errorf("invalid format %q: choose from %s", opts.format, strings.Join(ffmpeg.Formats(), ", "))
@@ -140,6 +213,9 @@ func parseFlags(args []string, stdout io.Writer) (*options, error) {
 	}
 	if opts.concurrency < 1 {
 		return nil, errors.New("concurrency must be at least 1")
+	}
+	if opts.jobs < 1 {
+		return nil, errors.New("jobs must be at least 1")
 	}
 	return &opts, nil
 }
@@ -156,9 +232,13 @@ func (a *app) run(ctx context.Context) error {
 	client := fetch.New()
 	if a.opts.debug {
 		client.Debugf = a.debugf
+		started := time.Now()
+		a.limiter.Logf = func(format string, args ...any) {
+			a.debugf("%5.1fs "+format, append([]any{time.Since(started).Seconds()}, args...)...)
+		}
 	}
-	site := anikoto.New(client)
-	series, err := site.Load(ctx, a.opts.url)
+	site := anikoto.New(client, a.opts.origin)
+	series, err := a.series(ctx, site, client)
 	if err != nil {
 		return err
 	}
@@ -176,174 +256,205 @@ func (a *app) run(ctx context.Context) error {
 		return nil
 	}
 
-	a.logf("%s: downloading %d of %d episodes", series.Title, len(episodes), len(series.Episodes))
-	failed := 0
-	for _, ep := range episodes {
-		err := a.episode(ctx, site, client, series, ep, width)
-		if ctx.Err() != nil {
-			return errors.New("interrupted")
-		}
-		if err != nil {
-			failed++
-			a.logf("E%0*d failed: %v", width, ep.Number, err)
+	// Request logging would break up the live progress lines, so debug
+	// output gets the plain display.
+	d := newDisplay(a.stderr, a.interactive && !a.opts.debug, len(episodes))
+	fmt.Fprintf(a.stderr, "\nDownloading %d of %d episodes\n\n", len(episodes), len(series.Episodes))
+	// Episodes are downloaded several at a time. Each CDN host has its own
+	// rate limit and episodes are spread across hosts, so episodes on
+	// different hosts do not slow each other down.
+	var (
+		t    tally
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		next = make(chan int)
+	)
+	for range min(a.opts.jobs, len(episodes)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				ep := episodes[i]
+				title := ep.Title
+				if title == "" {
+					title = fmt.Sprintf("Episode %d", ep.Number)
+				}
+				r := d.begin(i+1, title)
+				done, err := a.episode(ctx, site, client, series, ep, width, r)
+
+				mu.Lock()
+				switch {
+				case ctx.Err() != nil:
+					r.finish(false, "interrupted")
+				case err != nil:
+					t.failed++
+					r.finish(false, "failed", strings.Split(err.Error(), "\n")...)
+				default:
+					if done.skipped {
+						t.skipped++
+					} else {
+						t.downloaded++
+						t.bytes += done.size
+					}
+					t.paths = append(t.paths, done.path)
+					r.finish(true, done.summary)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+feed:
+	for i := range episodes {
+		select {
+		case next <- i:
+		case <-ctx.Done():
+			break feed
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d of %d episodes failed", failed, len(episodes))
+	close(next)
+	wg.Wait()
+
+	a.report(t)
+	switch {
+	case ctx.Err() != nil:
+		return errors.New("interrupted")
+	case t.failed > 0:
+		return fmt.Errorf("%d of %d episodes failed", t.failed, len(episodes))
 	}
 	return nil
 }
 
-// episode downloads one episode from the first server that works.
-func (a *app) episode(ctx context.Context, site *anikoto.Site, client *fetch.Client, series *anikoto.Series, ep anikoto.Episode, width int) error {
-	label := fmt.Sprintf("E%0*d", width, ep.Number)
-	title := cleanName(series.Title)
-	dir := filepath.Join(a.opts.path, title)
-	base := filepath.Join(dir, strings.TrimSpace(fmt.Sprintf("%s %s %s", title, label, cleanName(ep.Title))))
-
-	if _, err := os.Stat(a.output(base)); err == nil {
-		a.logf("%s already downloaded: %s", label, a.output(base))
-		return nil
+// report prints the closing summary of a run.
+func (a *app) report(t tally) {
+	fmt.Fprintln(a.stderr)
+	for _, line := range t.lines() {
+		fmt.Fprintln(a.stderr, line)
 	}
-	if _, err := os.Stat(intermediate(base)); err == nil {
-		// An earlier run downloaded this episode but did not finish converting it.
-		return a.convert(ctx, base, label, 0)
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-
-	servers, err := site.Servers(ctx, ep)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	try := func(name string, resolve func() (*anikoto.Stream, error)) bool {
-		stream, err := resolve()
-		if err == nil {
-			err = a.download(ctx, client, stream, base, label)
-		}
-		if err != nil {
-			a.debugf("%s via %s: %v", label, name, err)
-			errs = append(errs, fmt.Errorf("%s: %w", name, err))
-		}
-		return err == nil
-	}
-
-	for _, server := range servers {
-		if server.Audio != a.opts.audio || !slices.Contains(a.opts.sources, server.Name) {
-			a.debugf("%s: skipping %s server %q", label, server.Audio, server.Name)
-			continue
-		}
-		if try(server.Name, func() (*anikoto.Stream, error) { return site.Resolve(ctx, server, a.opts.audio) }) {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-	}
-	if slices.Contains(a.opts.sources, "kiwi") {
-		if try("kiwi", func() (*anikoto.Stream, error) { return site.Kiwi(ctx, ep, a.opts.quality, a.opts.audio) }) {
-			return nil
-		}
-	}
-	if len(errs) == 0 {
-		return fmt.Errorf("no %s server matched the requested sources", a.opts.audio)
-	}
-	return errors.Join(errs...)
 }
 
-// download saves a stream's subtitles and video next to each other at base.
-func (a *app) download(ctx context.Context, client *fetch.Client, stream *anikoto.Stream, base, label string) error {
-	headers := map[string]string{
-		"Referer": stream.Referer,
-		"Origin":  strings.TrimRight(stream.Referer, "/"),
+// series settles which series to download and with what settings. It loads
+// the series named on the command line, then hands over to the wizard for
+// whatever is still open: the search, if there is no series yet, and any
+// setting that was not given as a flag.
+func (a *app) series(ctx context.Context, site *anikoto.Site, client *fetch.Client) (*anikoto.Series, error) {
+	var series *anikoto.Series
+	query := a.opts.query
+	if a.opts.url != "" {
+		var err error
+		series, err = site.Load(ctx, a.opts.url)
+		switch {
+		case err == nil:
+			query = ""
+		case !a.opts.bareWord || !notFound(err):
+			return nil, err
+		case !a.interactive:
+			return nil, fmt.Errorf("no series has the slug %q; run kotori in a terminal to search for it", a.opts.query)
+		}
 	}
-	if a.opts.subtitles {
-		a.subtitles(ctx, client, stream, headers, base, label)
+	if series == nil && !a.interactive {
+		return nil, errors.New("searching needs a terminal; pass a series slug or URL instead")
 	}
 
-	d := &hls.Downloader{
-		Client:      client,
-		Headers:     headers,
-		Quality:     a.opts.quality,
-		Concurrency: a.opts.concurrency,
-		Progress: func(p hls.Progress) {
-			fmt.Fprintf(a.stderr, "\r\033[K%s  %d/%d segments  %.1f MB", label, p.Done, p.Total, float64(p.Bytes)/1e6)
+	ask := a.interactive && !a.opts.yes && !a.opts.list
+	cfg := tui.Config{
+		Site:         site,
+		Series:       series,
+		Query:        query,
+		AskEpisodes:  ask && !a.opts.given.episodes,
+		AskAudio:     ask && !a.opts.given.audio,
+		AskQuality:   ask && !a.opts.given.quality,
+		AskFormat:    ask && !a.opts.given.format,
+		AskSubtitles: ask && !a.opts.given.subtitles,
+		AskPath:      ask && !a.opts.given.path,
+		AskNaming:    ask && !a.opts.given.naming,
+		Defaults: tui.Choices{
+			Path:      a.opts.path,
+			Naming:    a.opts.template,
+			Episodes:  a.opts.episodes,
+			Audio:     a.opts.audio,
+			Quality:   a.opts.quality,
+			Format:    a.opts.format,
+			Subtitles: a.opts.subtitleFormat,
 		},
-		Logf: func(format string, args ...any) {
-			if a.opts.debug {
-				fmt.Fprint(a.stderr, "\r\033[K")
-				a.debugf(label+": "+format, args...)
-			}
-		},
+		Qualities:       qualities,
+		Formats:         formatOptions(),
+		SubtitleFormats: subtitleOptions(),
+		NamingHint:      templateHint,
+		Preview:         previewTemplate,
 	}
-	// Request logging would interleave with the progress line.
+	for _, preset := range namingPresets {
+		cfg.Namings = append(cfg.Namings, tui.Option{Label: preset.name, Value: preset.template})
+	}
+	if !a.opts.subtitles {
+		cfg.Defaults.Subtitles = noSubtitles
+	}
+	// Request logging would draw over the wizard.
 	debugf := client.Debugf
 	client.Debugf = nil
-	result, err := d.Download(ctx, stream.URL, intermediate(base))
+	outcome, err := tui.Run(ctx, cfg)
 	client.Debugf = debugf
-	fmt.Fprint(a.stderr, "\r\033[K")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if result.Dropped > 0 {
-		a.debugf("%s: dropped %d filler segments", label, result.Dropped)
+	a.opts.episodes = outcome.Episodes
+	a.opts.audio = outcome.Audio
+	a.opts.quality = outcome.Quality
+	a.opts.format = outcome.Format
+	a.opts.path = outcome.Path
+	a.opts.template = outcome.Naming
+	if a.opts.subtitles = outcome.Subtitles != noSubtitles; a.opts.subtitles {
+		a.opts.subtitleFormat = outcome.Subtitles
 	}
-
-	return a.convert(ctx, base, label, result.Height)
+	return outcome.Series, nil
 }
 
-// intermediate is where an episode's raw stream sits between download and
-// conversion.
-func intermediate(base string) string {
-	return base + ".download"
+// notFound reports whether loading a page failed because it is not there,
+// as opposed to the site being unreachable.
+func notFound(err error) bool {
+	var status *fetch.StatusError
+	return errors.Is(err, anikoto.ErrNotSeries) || errors.As(err, &status) && status.Code == http.StatusNotFound
 }
 
-func (a *app) output(base string) string {
-	return base + "." + a.opts.format
+// formatOptions lists the output formats for the wizard, with the ones
+// that keep the original quality first.
+func formatOptions() []tui.Option {
+	var copied, reencoded []tui.Option
+	for _, name := range ffmpeg.Formats() {
+		if ffmpeg.Reencodes(name) {
+			reencoded = append(reencoded, tui.Option{Value: name, Note: "re-encoded, slow"})
+		} else {
+			copied = append(copied, tui.Option{Value: name})
+		}
+	}
+	return append(copied, reencoded...)
 }
 
-// convert turns a downloaded stream into the requested format. The raw
-// stream is kept if conversion fails, so the next run can pick it up.
-func (a *app) convert(ctx context.Context, base, label string, height int) error {
-	if ffmpeg.Reencodes(a.opts.format) {
-		a.logf("%s: re-encoding to %s, this can take a while", label, a.opts.format)
+// previewTemplate shows what a file name pattern produces for the first
+// episode that would be downloaded, or why the pattern cannot be used.
+func previewTemplate(template string, series *anikoto.Series, c tui.Choices) (string, error) {
+	if err := validateTemplate(template); err != nil {
+		return "", err
 	}
-	out := a.output(base)
-	if err := ffmpeg.Convert(ctx, a.ffmpeg, intermediate(base), out, a.opts.format); err != nil {
-		return err
+	episodes, err := selectEpisodes(series.Episodes, c.Episodes, false)
+	if err != nil || len(episodes) == 0 {
+		episodes = series.Episodes
 	}
-	os.Remove(intermediate(base))
-	if height > 0 {
-		a.logf("%s saved (%dp): %s", label, height, out)
-	} else {
-		a.logf("%s saved: %s", label, out)
-	}
-	return nil
+	name := expandTemplate(template, series, episodes[0], numberWidth(len(series.Episodes)), c.Audio)
+	return name + "." + c.Format, nil
 }
 
-// subtitles saves every track whose label matches the requested language. A
-// missing subtitle never fails the episode.
-func (a *app) subtitles(ctx context.Context, client *fetch.Client, stream *anikoto.Stream, headers map[string]string, base, label string) {
-	for _, track := range stream.Tracks {
-		if track.File == "" || !strings.Contains(strings.ToLower(track.Label), strings.ToLower(a.opts.subtitleLang)) {
-			continue
-		}
-		path := base + "." + languageCode(track.Label) + ".vtt"
-		if _, err := os.Stat(path); err == nil {
-			continue
-		}
-		resp, err := client.Get(ctx, track.File, headers)
-		if err == nil {
-			err = os.WriteFile(path, resp.Body, 0o644)
-		}
-		if err != nil {
-			a.logf("%s: %s subtitles failed: %v", label, track.Label, err)
-			continue
-		}
-		a.logf("%s subtitles saved: %s", label, path)
+// noSubtitles is the wizard's choice for skipping subtitles.
+const noSubtitles = "none"
+
+// subtitleOptions lists the subtitle formats for the wizard, plus the choice
+// to go without.
+func subtitleOptions() []tui.Option {
+	notes := map[string]string{"vtt": "WebVTT, as the site provides them", "srt": "SubRip", "ass": "Advanced SubStation Alpha"}
+	var options []tui.Option
+	for _, name := range ffmpeg.SubtitleFormats() {
+		options = append(options, tui.Option{Value: name, Note: notes[name]})
 	}
+	return append(options, tui.Option{Value: noSubtitles, Note: "don't download subtitles"})
 }
 
 func (a *app) logf(format string, args ...any) {

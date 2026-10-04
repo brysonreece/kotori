@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 )
 
@@ -77,13 +78,44 @@ func Convert(ctx context.Context, ffmpeg, src, dst, name string) error {
 	if !ok {
 		return fmt.Errorf("ffmpeg: unsupported format %q", name)
 	}
+	return run(ctx, ffmpeg, src, dst, append(slices.Clone(f.codec), "-f", f.muxer)...)
+}
+
+// subtitleMuxers maps each subtitle format, named by its file extension, to
+// ffmpeg's name for it.
+var subtitleMuxers = map[string]string{"vtt": "webvtt", "srt": "srt", "ass": "ass"}
+
+// SubtitleFormats lists the supported subtitle formats, most common first.
+func SubtitleFormats() []string {
+	return []string{"vtt", "srt", "ass"}
+}
+
+// SupportedSubtitle reports whether name is a subtitle format
+// ConvertSubtitle can write.
+func SupportedSubtitle(name string) bool {
+	_, ok := subtitleMuxers[name]
+	return ok
+}
+
+// ConvertSubtitle writes the subtitle file src to dst in the named format.
+// dst only appears once the conversion has finished.
+func ConvertSubtitle(ctx context.Context, ffmpeg, src, dst, name string) error {
+	muxer, ok := subtitleMuxers[name]
+	if !ok {
+		return fmt.Errorf("ffmpeg: unsupported subtitle format %q", name)
+	}
+	return run(ctx, ffmpeg, src, dst, "-f", muxer)
+}
+
+// run converts src with the given output arguments, writing to a temporary
+// file that is only renamed to dst on success.
+func run(ctx context.Context, ffmpeg, src, dst string, output ...string) error {
 	tmp := dst + ".part"
 	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-i", src}
-	args = append(args, f.codec...)
-	args = append(args, "-f", f.muxer, tmp)
-	if output, err := exec.CommandContext(ctx, ffmpeg, args...).CombinedOutput(); err != nil {
+	args = append(append(args, output...), tmp)
+	if out, err := exec.CommandContext(ctx, ffmpeg, args...).CombinedOutput(); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("ffmpeg: %w: %s", err, output)
+		return fmt.Errorf("ffmpeg: %w: %s", err, out)
 	}
 	return os.Rename(tmp, dst)
 }

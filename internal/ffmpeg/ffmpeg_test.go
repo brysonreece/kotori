@@ -90,3 +90,45 @@ func TestFormats(t *testing.T) {
 		t.Error("Reencodes is wrong")
 	}
 }
+
+func TestConvertSubtitle(t *testing.T) {
+	ffmpeg, err := Find()
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "episode.en.vtt")
+	vtt := "WEBVTT\n\n00:00:01.000 --> 00:00:03.500\nHello there.\n\n00:00:04.000 --> 00:00:06.000\nGeneral Kenobi.\n"
+	if err := os.WriteFile(src, []byte(vtt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// What each format's output must contain: the cue text, in its own timing syntax.
+	want := map[string][]string{
+		"vtt": {"WEBVTT", "00:01.000 --> 00:03.500", "Hello there."},
+		"srt": {"00:00:01,000 --> 00:00:03,500", "Hello there.", "General Kenobi."},
+		"ass": {"[Script Info]", "0:00:01.00,0:00:03.50", "Hello there."},
+	}
+	for _, name := range SubtitleFormats() {
+		t.Run(name, func(t *testing.T) {
+			dst := filepath.Join(dir, "out."+name)
+			if err := ConvertSubtitle(context.Background(), ffmpeg, src, dst, name); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, text := range want[name] {
+				if !strings.Contains(string(got), text) {
+					t.Errorf("output is missing %q:\n%s", text, got)
+				}
+			}
+		})
+	}
+	if err := ConvertSubtitle(context.Background(), ffmpeg, src, filepath.Join(dir, "out.sub"), "sub"); err == nil {
+		t.Error("expected an error for an unsupported format")
+	}
+	if !SupportedSubtitle("srt") || SupportedSubtitle("mp4") {
+		t.Error("SupportedSubtitle is wrong")
+	}
+}

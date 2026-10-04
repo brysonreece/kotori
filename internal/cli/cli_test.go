@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/brysonreece/kotori/internal/anikoto"
+	"github.com/brysonreece/kotori/internal/ffmpeg"
 )
 
 func TestParseEpisodeSpec(t *testing.T) {
@@ -148,13 +151,13 @@ func TestParseFlags(t *testing.T) {
 	}
 
 	for _, bad := range [][]string{
-		{},
-		{"a", "b"},
 		{"url", "-q", "999"},
 		{"url", "-a", "raw"},
 		{"url", "-s", "nope"},
 		{"url", "-c", "0"},
+		{"url", "-j", "0"},
 		{"url", "-f", "ts"},
+		{"url", "--subtitle-format", "sub"},
 	} {
 		if _, err := parseFlags(bad, io.Discard); err == nil {
 			t.Errorf("parseFlags(%v) should fail", bad)
@@ -171,8 +174,13 @@ func TestRunExitCodes(t *testing.T) {
 	if code := Run(context.Background(), []string{"--help"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "--quality") {
 		t.Errorf("--help: code %d, output %q", code, stdout.String())
 	}
-	if code := Run(context.Background(), nil, &stdout, &stderr); code != 2 {
-		t.Errorf("no arguments: code %d, want 2", code)
+	if code := Run(context.Background(), []string{"-q", "1"}, &stdout, &stderr); code != 2 {
+		t.Errorf("bad flag: code %d, want 2", code)
+	}
+	// Searching needs someone at a terminal, which a test does not have.
+	stderr.Reset()
+	if code := Run(context.Background(), []string{"--list"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "needs a terminal") {
+		t.Errorf("no arguments: code %d, stderr %q", code, stderr.String())
 	}
 }
 
@@ -183,5 +191,133 @@ func TestRunRequiresFFmpeg(t *testing.T) {
 	code := Run(context.Background(), []string{"http://127.0.0.1:1/watch/x"}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "ffmpeg is required") {
 		t.Errorf("code %d, stderr %q", code, stderr.String())
+	}
+}
+
+func TestParseArguments(t *testing.T) {
+	t.Setenv(baseURLEnv, "")
+	cases := []struct {
+		args     []string
+		url      string
+		query    string
+		bareWord bool
+	}{
+		{nil, "", "", false},
+		{[]string{"naruto"}, "https://anikototv.to/watch/naruto", "naruto", true},
+		{[]string{"dragon", "ball"}, "", "dragon ball", false},
+		{[]string{"dragon ball"}, "", "dragon ball", false},
+		{[]string{"https://anikototv.to/watch/x/ep-1"}, "https://anikototv.to/watch/x/ep-1", "https://anikototv.to/watch/x/ep-1", false},
+	}
+	for _, c := range cases {
+		opts, err := parseFlags(c.args, io.Discard)
+		if err != nil {
+			t.Errorf("parseFlags(%v): %v", c.args, err)
+			continue
+		}
+		if opts.url != c.url || opts.query != c.query || opts.bareWord != c.bareWord {
+			t.Errorf("parseFlags(%v) = url %q, query %q, bareWord %v", c.args, opts.url, opts.query, opts.bareWord)
+		}
+		if opts.origin != "https://anikototv.to" {
+			t.Errorf("origin = %q", opts.origin)
+		}
+	}
+}
+
+func TestGivenSettings(t *testing.T) {
+	t.Setenv(baseURLEnv, "")
+	opts, err := parseFlags([]string{"x", "-q", "1080", "--last"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A flag counts as given even when it repeats the default.
+	if g := opts.given; !g.quality || !g.episodes || g.audio || g.format || g.subtitles {
+		t.Errorf("given = %+v", g)
+	}
+	if opts.subtitleFormat != "vtt" {
+		t.Errorf("default subtitle format = %q", opts.subtitleFormat)
+	}
+	for _, args := range [][]string{{"x", "--subtitle-format", ".SRT"}, {"x", "--no-subtitles"}} {
+		opts, err := parseFlags(args, io.Discard)
+		if err != nil || !opts.given.subtitles {
+			t.Errorf("parseFlags(%v): given %+v, err %v", args, opts, err)
+		}
+	}
+}
+
+func TestFormatOptions(t *testing.T) {
+	var names []string
+	for _, o := range formatOptions() {
+		names = append(names, o.Value)
+	}
+	if got := strings.Join(names, ","); got != "mkv,mov,mp4,avi,webm" {
+		t.Errorf("got %s", got)
+	}
+}
+
+func TestSubtitleFormat(t *testing.T) {
+	cases := []struct {
+		source, body, want string
+	}{
+		{"https://cdn.example/subs/eng-2.vtt", "WEBVTT\n\n", "vtt"},
+		// Content wins over a misleading name.
+		{"https://cdn.example/subs/eng.srt", "\xef\xbb\xbfWEBVTT\n", "vtt"},
+		{"https://cdn.example/subs/eng.txt", "[Script Info]\nTitle: x", "ass"},
+		{"https://cdn.example/subs/eng.SRT?token=1", "1\n00:00:01,000 --> 00:00:02,000\nHi", "srt"},
+		{"https://cdn.example/subs/eng", "who knows", "vtt"},
+	}
+	for _, c := range cases {
+		if got := subtitleFormat(c.source, []byte(c.body)); got != c.want {
+			t.Errorf("subtitleFormat(%q) = %q, want %q", c.source, got, c.want)
+		}
+	}
+}
+
+func TestSaveSubtitle(t *testing.T) {
+	path, err := ffmpeg.Find()
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	vtt := []byte("WEBVTT\n\n00:00:01.000 --> 00:00:03.500\nHello there.\n")
+	dir := t.TempDir()
+	files := func() string {
+		entries, _ := os.ReadDir(dir)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return strings.Join(names, ",")
+	}
+
+	// Converted: only the requested format is left behind.
+	a := &app{ffmpeg: path, stderr: io.Discard}
+	d := newDisplay(io.Discard, false, 1).begin(1, "Show")
+	a.opts.subtitleFormat = "srt"
+	if err := a.saveSubtitle(context.Background(), vtt, "https://cdn.example/eng.vtt", filepath.Join(dir, "Show E01.en"), d); err != nil {
+		t.Fatal(err)
+	}
+	if files() != "Show E01.en.srt" {
+		t.Fatalf("directory holds %s", files())
+	}
+	if body, _ := os.ReadFile(filepath.Join(dir, "Show E01.en.srt")); !strings.Contains(string(body), "00:00:01,000 --> 00:00:03,500") {
+		t.Errorf("not SubRip:\n%s", body)
+	}
+
+	// Already in the requested format: saved untouched.
+	a.opts.subtitleFormat = "vtt"
+	err = a.saveSubtitle(context.Background(), vtt, "https://cdn.example/eng.vtt", filepath.Join(dir, "Show E02.en"), d)
+	if body, _ := os.ReadFile(filepath.Join(dir, "Show E02.en.vtt")); err != nil || !bytes.Equal(body, vtt) {
+		t.Errorf("vtt was changed or not written: %v", err)
+	}
+
+	// Conversion fails: the original is kept under its own extension, and
+	// the episode is told about it.
+	a.opts.subtitleFormat = "srt"
+	a.ffmpeg = filepath.Join(dir, "no-such-ffmpeg")
+	err = a.saveSubtitle(context.Background(), vtt, "https://cdn.example/x.vtt", filepath.Join(dir, "Show E03.en"), d)
+	if body, _ := os.ReadFile(filepath.Join(dir, "Show E03.en.vtt")); err != nil || !bytes.Equal(body, vtt) {
+		t.Errorf("the original was not kept as .vtt: %v", err)
+	}
+	if len(d.notes) != 1 || !strings.Contains(d.notes[0], "kept as vtt") {
+		t.Errorf("notes = %q", d.notes)
 	}
 }

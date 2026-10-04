@@ -257,11 +257,9 @@ func TestDownloadBacksOffWhenRateLimited(t *testing.T) {
 	defer server.Close()
 
 	dest := filepath.Join(t.TempDir(), "x.download")
-	pauses := 0
-	d := &Downloader{
-		Client:      fetch.New(),
-		Concurrency: 2,
-		Logf:        func(string, ...any) { mu.Lock(); pauses++; mu.Unlock() },
+	d := &Downloader{Client: fetch.New(), Concurrency: 2}
+	if d.Paused() != 0 {
+		t.Error("a download that has not started reports a pause")
 	}
 	if _, err := d.Download(context.Background(), server.URL+"/index.m3u8", dest); err != nil {
 		t.Fatal(err)
@@ -270,7 +268,31 @@ func TestDownloadBacksOffWhenRateLimited(t *testing.T) {
 	if string(got) != "/a.ts/b.ts" {
 		t.Errorf("got %q", got)
 	}
-	if pauses != 6 {
-		t.Errorf("got %d pauses, want 6", pauses)
+	// Each segment was asked for until it was served, refusals and all.
+	if rejected["/a.ts"] != 4 || rejected["/b.ts"] != 4 {
+		t.Errorf("requests per segment = %v, want 4 each", rejected)
+	}
+}
+
+func TestRateLimitPause(t *testing.T) {
+	// The server's Retry-After is used as given, however the attempt count
+	// or the back-off cap compare.
+	for _, c := range []struct {
+		retryAfter time.Duration
+		attempt    int
+		want       time.Duration
+	}{
+		{10 * time.Second, 1, 10 * time.Second},
+		{time.Second, 5, time.Second},
+		{5 * time.Minute, 1, 5 * time.Minute},
+		// Without one, the pause doubles per attempt, up to the cap.
+		{0, 1, time.Second},
+		{0, 2, 2 * time.Second},
+		{0, 4, 8 * time.Second},
+		{0, 7, time.Minute},
+	} {
+		if got := rateLimitPause(c.retryAfter, c.attempt); got != c.want {
+			t.Errorf("rateLimitPause(%s, %d) = %s, want %s", c.retryAfter, c.attempt, got, c.want)
+		}
 	}
 }

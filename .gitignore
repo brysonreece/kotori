@@ -9,4 +9,6 @@
 *.avi
 *.webm
 *.vtt
+*.srt
+*.ass
 .DS_Store
